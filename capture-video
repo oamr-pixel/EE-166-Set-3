@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+'''
+Take a short video with the Raspberry Pi's camera.
+
+Author: Mason McGill
+License: MIT
+Dependencies: clize>=4.1 numpy>=1.18 picamera>=1.13
+'''
+from pathlib import Path
+from time import sleep
+from typing import List
+
+import clize
+import numpy as np
+import picamera
+import picamera.array
+
+#------------------------------------------------------------------------------
+# Hardware-interfacing functions based on code by Richard Bowman available at
+# https://gist.github.com/rwb27/a23808e9f4008b48de95692a38ddaa08
+
+def set_analog_gain(camera: picamera.PiCamera, value: float) -> None:
+    picamera.mmal.mmal_port_parameter_set_rational(
+        camera._camera.control._port,
+        picamera.mmal.MMAL_PARAMETER_GROUP_CAMERA + 0x59,
+        picamera.mmalobj.to_rational(value)
+    )
+
+def set_digital_gain(camera: picamera.PiCamera, value: float) -> None:
+    picamera.mmal.mmal_port_parameter_set_rational(
+        camera._camera.control._port,
+        picamera.mmal.MMAL_PARAMETER_GROUP_CAMERA + 0x5A,
+        picamera.mmalobj.to_rational(value)
+    )
+
+#------------------------------------------------------------------------------
+# Frame writer
+
+class FrameWriter:
+    def __init__(self, camera: picamera.PiCamera, dst: Path) -> None:
+        self.camera = camera
+        self.dst = dst
+        self.frames: List[bytes] = []
+
+    def write(self, frame: bytes) -> None:
+        self.frames.append(frame)
+
+    def flush(self) -> None:
+        self.dst.mkdir(parents=True, exist_ok=True)
+        for i, frame in enumerate(self.frames):
+            np.savez(
+                f'{self.dst}/{i:06d}.npz',
+                n_shots = 1,
+                exposure = self.camera.shutter_speed / 1000,
+                analog_gain = float(self.camera.analog_gain),
+                digital_gain = float(self.camera.digital_gain),
+                red_gain = float(self.camera.awb_gains[0]),
+                blue_gain = float(self.camera.awb_gains[1]),
+                data = np.frombuffer(frame, np.uint8).reshape(
+                    (*self.camera.resolution[::-1], 3)
+                )
+            )
+
+#------------------------------------------------------------------------------
+# Exported command
+
+@clize.run
+def capture_image(dst: Path = Path('captured-video'), *,
+                  frame_height: int = 640,
+                  frame_width: int = 480,
+                  framerate: int = 12,
+                  duration: float = 3.0,
+                  analog_gain: float = 1.0,
+                  digital_gain: float = 1.0,
+                  red_gain: float = 1.2,
+                  blue_gain: float = 2.8,
+                  exposure: float = 33.0,
+                  interactive: bool = False) -> None:
+    '''
+    Take a short video with the Raspberry Pi's camera.
+
+    :param dst: The output destination (an NPZ file)
+    :param frame_height: The height of each frame, in pixels
+    :param frame_width: The width of each frame, in pixels
+    :param framerate: The number of frames to capture per second
+    :param duration: The video duration, in seconds
+    :param analog_gain: The pre-quantization gain factor
+    :param digital_gain: The post-quantization gain factor
+    :param red_gain: The red channel gain factor, relative to green
+    :param blue_gain: The blue channel gain factor, relative to green
+    :param exposure: The exposure duration, in milliseconds
+    :param interactive: Whether to wait for a keypress
+
+    The Pi camera supports exposure durations from 0.009 to 33 milliseconds.
+    To emulate longer exposures, multiple shots can be combined by specifying
+    "n-shots". The "data" field in each video frame is a linear image.
+    '''
+    # Set everything possible to "manual mode". Note: The PiCam is a bit of an
+    # intricate state machine, so be careful about reordering these settings.
+    print(f'Configuring the camera...')
+    camera = picamera.PiCamera()
+    camera.resolution = (frame_height, frame_width)
+    camera.awb_mode = 'off'
+    camera.awb_gains = (red_gain, blue_gain)
+    camera.exposure_mode = 'off'
+    camera.shutter_speed = int(1000 * exposure)
+    camera.framerate = framerate
+    set_analog_gain(camera, analog_gain)
+    set_digital_gain(camera, digital_gain)
+
+    # Take a breath. Getting the settings
+    # to sink in takes a hot second.
+    last_digital_gain = -1
+    while camera.digital_gain != last_digital_gain:
+        last_digital_gain = camera.digital_gain
+        sleep(0.5)
+
+    # Report the camera's parameters, which may be
+    # slightly different from those requested.
+    print(f'  Analog gain: {float(camera.analog_gain)}')
+    print(f'  Base digital gain: {float(camera.digital_gain)}')
+    print(f'  Red/green gain ratio: {float(camera.awb_gains[0])}')
+    print(f'  Blue/green gain ratio: {float(camera.awb_gains[1])}')
+    print(f'  Exposure: {camera.shutter_speed / 1000}ms')
+
+    # Provide a rich user experience.
+    camera.start_preview(fullscreen=False, window=(100, 100, 400, 300))
+    if interactive: input('Press any key to start capture.')
+
+    # Capture video.
+    print(f'Capturing video...')
+    camera.start_recording(FrameWriter(camera, dst), format='rgb')
+    camera.wait_recording(duration)
+
+    # Write each frame as a NumPy archive.
+    print(f'Saving your masterpiece as "{dst}"...')
+    camera.stop_recording()
+    print('Done!')
